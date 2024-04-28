@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,7 +22,7 @@ var lastReceived *time.Time
 func main() {
 	exitIdleTime := flag.Duration("exit-idle-time", 0, "Exit when without a connection for this duration")
 	printUsage := flag.Bool("help", false, "Print help text and exit")
-	bufSize := flag.Uint("buffer", 8192, "Buffer size in bytes")
+	bufSize := flag.Uint("buffer", 1024, "Buffer size in bytes")
 
 	flag.Parse()
 	if *printUsage {
@@ -38,16 +39,9 @@ func main() {
 		log.Fatal("no targets provided")
 	}
 
-	fds := activation.Files(true)
-
-	var lis []net.PacketConn
-	fmt.Println(len(fds))
-	for _, fd := range fds {
-		sock, err := net.FilePacketConn(fd)
-		if err != nil {
-			log.Fatal("failed to attach to systemd activation sockets, err: ", err.Error())
-		}
-		lis = append(lis, sock)
+	lis, err := activation.PacketConns()
+	if err != nil {
+		log.Fatal("couldn't start listening to systemd sockets - launched outside systemd?, err:" + err.Error())
 	}
 
 	if len(lis) == 0 {
@@ -64,16 +58,19 @@ func main() {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go func() {
-		for range time.Tick(time.Second * 10) {
-			if lastReceived.Add(*exitIdleTime).Before(time.Now()) {
-				cancel()
-				return
+	if *exitIdleTime != 0 {
+		go func() {
+			for range time.Tick(time.Second * 10) {
+				if lastReceived.Add(*exitIdleTime).Before(time.Now()) {
+					log.Println("idle-time has been exceeded, exiting")
+					cancel()
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
 
-	addr0, err := net.ResolveUDPAddr("udp4", targets[0])
+	addr0, err := net.ResolveUDPAddr("udp", targets[0])
 	if err != nil {
 		panic(err)
 	}
@@ -103,7 +100,7 @@ func forwardLoop(ctx context.Context, bufSz uint, in net.PacketConn, target *net
 	in.SetReadDeadline(now.Add(timeout))
 	lastReceived = &now
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, bufSz)
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -112,8 +109,6 @@ func forwardLoop(ctx context.Context, bufSz uint, in net.PacketConn, target *net
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
-
-		fmt.Println("pkt from: ", src.String())
 
 		now := time.Now()
 		in.SetReadDeadline(now.Add(timeout))
@@ -133,22 +128,27 @@ func forwardLoop(ctx context.Context, bufSz uint, in net.PacketConn, target *net
 			return errors.Wrap(err, "failed to get a transparent socket")
 		}
 
-		log.Println("pkt rcvd")
-		log.Println("sending to ", target.String())
-
 		if _, err = sock.WriteTo(buf[0:n], target); err != nil {
 			log.Printf("failed to forward packets err: %v", err)
 		}
 
-		log.Println("pkt sent")
 	}
 	return nil
 }
 
+var socks = map[string]net.PacketConn{}
+var mu sync.Mutex
+
 func getOrCreateTransSock(src *net.UDPAddr) (net.PacketConn, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	if v, ok := socks[src.String()]; ok {
+		return v, nil
+	}
+
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK, syscall.IPPROTO_UDP)
 	if err != nil {
-		fmt.Println("failed to create an AF_INET socket")
+		return nil, errors.Wrap(err, "failed to create an AF_INET socket")
 	}
 
 	if err = syscall.SetsockoptInt(fd, syscall.SOL_IP, syscall.IP_FREEBIND, 1); err != nil {
@@ -173,5 +173,6 @@ func getOrCreateTransSock(src *net.UDPAddr) (net.PacketConn, error) {
 		return nil, errors.Wrap(err, "filepacket conn failed")
 	}
 
+	socks[src.String()] = sock
 	return sock, nil
 }
